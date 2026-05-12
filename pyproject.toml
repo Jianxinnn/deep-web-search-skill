@@ -1,0 +1,6 @@
+[project]
+name = "deep-web-search-skill"
+version = "0.1.0"
+description = "Standalone Deep Web Search skill for traceable academic literature search."
+requires-python = ">=3.9"
+dependencies = []

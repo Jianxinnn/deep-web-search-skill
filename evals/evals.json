@@ -1,0 +1,29 @@
+{
+  "skill_name": "deep-web-search",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Deep web search academic and technical sources about LLM agent skill libraries and self-improving agents.",
+      "expected_output": "The agent should use the deep-web-search skill, choose the agent_skills profile, run or propose skills/deep-web-search/scripts/deep_web_search.py, and inspect the resulting bundle.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I need an academic deep search for protein binder design with diffusion models, with evidence I can audit later.",
+      "expected_output": "The agent should use skills/deep-web-search/scripts/deep_web_search.py with the biomol profile and explain the generated bundle files, especially evidence and provenance records.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Read this Deep Web Search bundle and tell me which sources support the main claim.",
+      "expected_output": "The agent should inspect bundle files in the recommended order and cite source_id or evidence_id rather than making unsupported claims.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Find similar work to Rational engineering of allosteric protein switches by in silico prediction of domain insertion sites.",
+      "expected_output": "The agent should use the biomol profile, rely on mechanism-focused refinements such as domain insertion and synthetic allostery, and present a ranked similar-works table with source_id/evidence_id citations.",
+      "files": []
+    }
+  ]
+}
