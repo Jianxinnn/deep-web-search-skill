@@ -75,10 +75,13 @@ Supported providers are configured with `--providers`:
 ```bash
 python3 skills/deep-web-search/scripts/deep_web_search.py search "$QUESTION" \
   --providers tavily,semantic_scholar,pubmed,openalex,arxiv \
+  --progress \
   --out ./deep-web-search-bundle
 ```
 
 Provider calls run in parallel by default with `--workers 5`. Semantic Scholar requests are still limited to one request per second inside the script. Use `--workers 1` for fully serial execution when debugging or when another provider rate limit is tight.
+
+Use `--progress` when running inside an Agent harness that streams terminal output. Progress lines are written to stderr and do not change the generated bundle files.
 
 ## Implementation Split
 

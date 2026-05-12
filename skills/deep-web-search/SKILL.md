@@ -44,6 +44,7 @@ python3 scripts/deep_web_search.py search "$QUESTION" \
   --profile general \
   --providers tavily,semantic_scholar,pubmed,openalex,arxiv \
   --workers 5 \
+  --progress \
   --out ./deep-web-search-bundle
 ```
 
@@ -56,6 +57,9 @@ python3 scripts/deep_web_search.py inspect ./deep-web-search-bundle
 Write bundles to the caller's workspace or explicit output path, not inside this skill directory.
 
 Provider calls are parallel by default with `--workers 5`. Semantic Scholar requests are still limited to one request per second inside the script. Use `--workers 1` for fully serial execution when debugging or when another provider rate limit is tight. Bundle writing and ranking remain single-process and deterministic.
+
+Use `--progress` when the caller wants live status in an Agent harness. Progress is printed
+to stderr; JSON/JSONL bundle files remain clean.
 
 ## Profiles
 

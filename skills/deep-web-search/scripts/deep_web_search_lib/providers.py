@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Any, Callable
 
 from .models import DEFAULT_WORKERS, QueryRecord, SourceRecord, now_iso, parse_year, slug, stable_id
 from .net import fetch_json, fetch_text, post_json
@@ -359,7 +359,16 @@ def provider_task(index: int, provider: str, query: QueryRecord, limit: int) -> 
         return index, [], provider_error(provider, query, exc)
 
 
-def run_provider_queries(queries: list[QueryRecord], providers: list[str], limit: int, workers: int = DEFAULT_WORKERS) -> tuple[list[SourceRecord], list[dict[str, Any]]]:
+ProviderProgress = Callable[[int, list[SourceRecord], dict[str, Any]], None]
+
+
+def run_provider_queries(
+    queries: list[QueryRecord],
+    providers: list[str],
+    limit: int,
+    workers: int = DEFAULT_WORKERS,
+    progress: ProviderProgress | None = None,
+) -> tuple[list[SourceRecord], list[dict[str, Any]]]:
     tasks: list[tuple[int, str, QueryRecord]] = []
     for query in queries:
         for provider in providers:
@@ -369,11 +378,21 @@ def run_provider_queries(queries: list[QueryRecord], providers: list[str], limit
 
     worker_count = max(1, min(workers, len(tasks)))
     if worker_count == 1:
-        results = [provider_task(index, provider, query, limit) for index, provider, query in tasks]
+        results = []
+        for index, provider, query in tasks:
+            item = provider_task(index, provider, query, limit)
+            results.append(item)
+            if progress:
+                progress(*item)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = [executor.submit(provider_task, index, provider, query, limit) for index, provider, query in tasks]
-            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            results = []
+            for future in concurrent.futures.as_completed(futures):
+                item = future.result()
+                results.append(item)
+                if progress:
+                    progress(*item)
 
     sources: list[SourceRecord] = []
     provenance: list[dict[str, Any]] = []

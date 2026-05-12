@@ -108,6 +108,17 @@ class DeepWebSearchTests(unittest.TestCase):
             [("fake_a", "q1", "ok"), ("fake_b", "q1", "ok"), ("fake_a", "q2", "ok"), ("fake_b", "q2", "ok")],
         )
 
+    def test_run_provider_queries_reports_progress(self):
+        def fake_search(query, limit):
+            return [deep_web_search.SourceRecord(source_id=f"src-{query}", title=query, provider="fake")]
+
+        queries = [deep_web_search.QueryRecord("q1", "primary", ["fake"])]
+        events = []
+        with patch.dict(deep_web_search.SEARCHERS, {"fake": fake_search}, clear=True):
+            deep_web_search.run_provider_queries(queries, ["fake"], 1, workers=1, progress=lambda index, rows, event: events.append((index, len(rows), event["status"])))
+
+        self.assertEqual(events, [(0, 1, "ok")])
+
     def test_semantic_scholar_rate_limit_waits_between_requests(self):
         now = {"value": 10.0}
         sleeps = []
