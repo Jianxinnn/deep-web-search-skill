@@ -21,6 +21,9 @@ Read provider keys from environment variables in the shell/session that runs the
 
 The skill does not call an LLM or embedding API internally. Use the generated bundle as grounded context for the Agent's own synthesis.
 
+The stable CLI entry point is `scripts/deep_web_search.py`; implementation modules live in
+`scripts/deep_web_search_lib/`.
+
 ## Run
 
 Resolve paths relative to this `SKILL.md` directory.

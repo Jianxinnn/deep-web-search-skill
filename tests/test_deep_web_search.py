@@ -143,7 +143,7 @@ class DeepWebSearchTests(unittest.TestCase):
     def test_tavily_normalizes_web_results(self):
         payload = {"results": [{"url": "https://example.com/a", "title": "Example A", "content": "Useful web evidence."}]}
         with patch.dict(deep_web_search.os.environ, {"TAVILY_API_KEY": "test"}, clear=True):
-            with patch.object(deep_web_search, "post_json", return_value=payload):
+            with patch.object(deep_web_search.providers, "post_json", return_value=payload):
                 rows = deep_web_search.search_tavily("protein design", 1)
 
         self.assertEqual(rows[0].provider, "tavily")
@@ -169,7 +169,7 @@ class DeepWebSearchTests(unittest.TestCase):
                 }
             ]
         }
-        with patch.object(deep_web_search, "fetch_json", return_value=payload):
+        with patch.object(deep_web_search.providers, "fetch_json", return_value=payload):
             rows = deep_web_search.search_semantic_scholar("agent skills", 1)
 
         self.assertEqual(rows[0].provider, "semantic_scholar")

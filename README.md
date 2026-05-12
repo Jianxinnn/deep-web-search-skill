@@ -19,6 +19,14 @@ deep-web-search-skill/
         bundle-contract.md
       scripts/
         deep_web_search.py
+        deep_web_search_lib/
+          cli.py
+          bundle.py
+          models.py
+          net.py
+          providers.py
+          queries.py
+          ranking.py
   tests/
     test_deep_web_search.py
   evals/
@@ -71,6 +79,17 @@ python3 skills/deep-web-search/scripts/deep_web_search.py search "$QUESTION" \
 ```
 
 Provider calls run in parallel by default with `--workers 5`. Semantic Scholar requests are still limited to one request per second inside the script. Use `--workers 1` for fully serial execution when debugging or when another provider rate limit is tight.
+
+## Implementation Split
+
+`scripts/deep_web_search.py` stays as the stable CLI entry point. The implementation is split into `scripts/deep_web_search_lib/`:
+
+- `cli.py`: command parsing and search orchestration.
+- `queries.py`: profile-aware and mechanism-focused query planning.
+- `providers.py`: Tavily, Semantic Scholar, PubMed/NCBI, OpenAlex, and arXiv adapters.
+- `ranking.py`: deduplication, scoring, focusing, and evidence row generation.
+- `bundle.py`: manifest, JSONL outputs, inspection, and `brief.md` rendering.
+- `models.py` / `net.py`: shared records, constants, file writing, and HTTP helpers.
 
 ## Local Installation
 
