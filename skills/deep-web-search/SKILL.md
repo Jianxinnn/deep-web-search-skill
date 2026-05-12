@@ -5,9 +5,21 @@ description: Use Deep Web Search for traceable academic and technical research. 
 
 # Deep Web Search
 
-Use the bundled standalone script to turn a research question into an auditable search bundle. The script searches arXiv/OpenAlex, ranks sources, extracts evidence snippets, and writes a presentation-ready `brief.md`.
+Use the bundled standalone script to turn a research question into an auditable search bundle. The script searches Tavily, Semantic Scholar, PubMed/NCBI, OpenAlex, and arXiv, ranks sources, extracts evidence snippets, and writes a presentation-ready `brief.md`.
 
-Do not use this skill as a general chat answer, memory system, final manuscript writer, or broad web crawler.
+Do not use this skill as a general chat answer, memory system, final manuscript writer, LLM triage system, or broad web crawler.
+
+## Configuration
+
+Read provider keys from environment variables in the shell/session that runs the script:
+
+- `TAVILY_API_KEY`: required for `tavily`; `TAVILY_BASE_URL` is optional.
+- `S2_API_KEY` or `Semantic_Search_API_KEY`: optional but recommended for `semantic_scholar`.
+- `NCBI_EMAIL`: recommended for `pubmed`; `NCBI_API_KEY` is optional.
+- `OPENALEX_EMAIL`: optional for `openalex`.
+- `arxiv`: no key.
+
+The skill does not call an LLM or embedding API internally. Use the generated bundle as grounded context for the Agent's own synthesis.
 
 ## Run
 
@@ -27,6 +39,8 @@ Run search:
 ```bash
 python3 scripts/deep_web_search.py search "$QUESTION" \
   --profile general \
+  --providers tavily,semantic_scholar,pubmed,openalex,arxiv \
+  --workers 5 \
   --out ./deep-web-search-bundle
 ```
 
@@ -37,6 +51,8 @@ python3 scripts/deep_web_search.py inspect ./deep-web-search-bundle
 ```
 
 Write bundles to the caller's workspace or explicit output path, not inside this skill directory.
+
+Provider calls are parallel by default with `--workers 5`. Semantic Scholar requests are still limited to one request per second inside the script. Use `--workers 1` for fully serial execution when debugging or when another provider rate limit is tight. Bundle writing and ranking remain single-process and deterministic.
 
 ## Profiles
 
@@ -65,13 +81,13 @@ Use JSONL files for audit. Cite `source_id` and `evidence_id`; do not invent bib
 
 - Deterministic ranking only; no LLM triage.
 - Metadata/abstract evidence only; no PDF full-text reading.
-- Providers currently supported: `arxiv`, `openalex`.
+- Providers currently supported: `tavily`, `semantic_scholar`, `pubmed`, `openalex`, `arxiv`.
 
 Provider narrowing example:
 
 ```bash
 python3 scripts/deep_web_search.py search "$QUESTION" \
-  --providers arxiv,openalex \
+  --providers semantic_scholar,pubmed,openalex,arxiv \
   --out ./deep-web-search-bundle
 ```
 

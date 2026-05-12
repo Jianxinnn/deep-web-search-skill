@@ -33,7 +33,18 @@ Use `source_id` from `sources.jsonl` and `evidence_id` from `evidence.jsonl` whe
 
 The standalone script currently supports:
 
-- `arxiv`
+- `tavily`
+- `semantic_scholar`
+- `pubmed`
 - `openalex`
+- `arxiv`
 
-Both work without API keys.
+Provider configuration:
+
+- `tavily` requires `TAVILY_API_KEY`; `TAVILY_BASE_URL` is optional.
+- `semantic_scholar` can use `S2_API_KEY` or `Semantic_Search_API_KEY`; keys are optional but recommended.
+- `pubmed` can use `NCBI_EMAIL` and `NCBI_API_KEY`; email is recommended and the API key is optional.
+- `openalex` can use `OPENALEX_EMAIL`; it is optional.
+- `arxiv` does not use an API key.
+
+Provider requests may run concurrently via `--workers`; Semantic Scholar requests are limited to one request per second. Output files remain deterministic because records are written in query/provider task order.

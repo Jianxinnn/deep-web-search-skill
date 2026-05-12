@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
 import re
 import socket
 import sys
+import threading
 import textwrap
 import time
 import urllib.error
@@ -19,7 +22,11 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROVIDERS = ["arxiv", "openalex"]
+DEFAULT_PROVIDERS = ["tavily", "semantic_scholar", "pubmed", "openalex", "arxiv"]
+DEFAULT_WORKERS = 5
+PROVIDER_RATE_LIMIT_SECONDS = {"semantic_scholar": 1.0}
+PROVIDER_RATE_LOCK = threading.Lock()
+PROVIDER_NEXT_ALLOWED_AT: dict[str, float] = {}
 BUNDLE_FORMAT_VERSION = "deep-web-search-1.0"
 BUNDLE_FILES = {
     "request": "request.json",
@@ -83,14 +90,21 @@ class SourceRecord:
     source_id: str
     title: str
     provider: str
+    source_type: str = "paper"
     url: str = ""
     abstract: str = ""
+    snippet: str = ""
     authors: list[str] = field(default_factory=list)
     year: int | None = None
     venue: str = ""
     doi: str = ""
     arxiv_id: str = ""
+    pubmed_id: str = ""
+    semantic_scholar_id: str = ""
+    openalex_id: str = ""
     pdf_url: str = ""
+    citation_count: int | None = None
+    fields: list[str] = field(default_factory=list)
     score: float = 0.0
     matches: list[str] = field(default_factory=list)
 
@@ -118,10 +132,21 @@ def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     )
 
 
-def fetch_text(url: str, timeout: int = 20) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "deep-web-search-skill/0.1"})
+def fetch_text(url: str, timeout: int = 20, headers: dict[str, str] | None = None, data: bytes | None = None) -> str:
+    request_headers = {"User-Agent": "deep-web-search-skill/0.1"}
+    request_headers.update(headers or {})
+    request = urllib.request.Request(url, data=data, headers=request_headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="replace")
+
+
+def fetch_json(url: str, timeout: int = 20, headers: dict[str, str] | None = None) -> Any:
+    return json.loads(fetch_text(url, timeout=timeout, headers=headers))
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: int = 30) -> Any:
+    data = json.dumps(payload).encode("utf-8")
+    return json.loads(fetch_text(url, timeout=timeout, headers={"Content-Type": "application/json"}, data=data))
 
 
 def unique_query_records(records: list[QueryRecord], limit: int) -> list[QueryRecord]:
@@ -259,8 +284,11 @@ def uninvert_abstract(index: dict[str, list[int]] | None) -> str:
 
 
 def search_openalex(query: str, limit: int) -> list[SourceRecord]:
-    params = urllib.parse.urlencode({"search": query, "per-page": limit, "sort": "relevance_score:desc"})
-    payload = json.loads(fetch_text(f"https://api.openalex.org/works?{params}"))
+    params: dict[str, Any] = {"search": query, "per-page": limit, "sort": "relevance_score:desc"}
+    email = os.getenv("OPENALEX_EMAIL", "").strip()
+    if email:
+        params["mailto"] = email
+    payload = fetch_json(f"https://api.openalex.org/works?{urllib.parse.urlencode(params)}")
     rows: list[SourceRecord] = []
     for item in payload.get("results", []):
         title = item.get("display_name") or ""
@@ -282,13 +310,209 @@ def search_openalex(query: str, limit: int) -> list[SourceRecord]:
                 year=item.get("publication_year"),
                 venue=source.get("display_name") or "",
                 doi=(item.get("doi") or "").replace("https://doi.org/", ""),
+                openalex_id=item.get("id") or "",
                 pdf_url=((location.get("pdf_url") or "") if isinstance(location, dict) else ""),
+                citation_count=item.get("cited_by_count"),
+            )
+        )
+    return rows
+
+
+def search_tavily(query: str, limit: int) -> list[SourceRecord]:
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Tavily requires TAVILY_API_KEY")
+    endpoint = os.getenv("TAVILY_BASE_URL", "").strip() or "https://api.tavily.com/search"
+    payload = post_json(
+        endpoint,
+        {
+            "api_key": key,
+            "query": query,
+            "search_depth": "basic",
+            "topic": "general",
+            "max_results": limit,
+            "include_answer": False,
+            "include_raw_content": False,
+            "include_images": False,
+            "use_cache": True,
+        },
+    )
+    rows: list[SourceRecord] = []
+    for item in (payload or {}).get("results", []):
+        url = item.get("url", "")
+        title = item.get("title") or url
+        snippet = item.get("content") or ""
+        rows.append(
+            SourceRecord(
+                source_id=stable_id("src", f"tavily:{url or title}"),
+                title=title,
+                provider="tavily",
+                source_type="web",
+                url=url,
+                snippet=snippet,
+            )
+        )
+    return rows
+
+
+def search_semantic_scholar(query: str, limit: int) -> list[SourceRecord]:
+    fields = ",".join(
+        [
+            "paperId",
+            "url",
+            "title",
+            "abstract",
+            "authors",
+            "year",
+            "venue",
+            "citationCount",
+            "openAccessPdf",
+            "externalIds",
+            "fieldsOfStudy",
+            "tldr",
+        ]
+    )
+    params = urllib.parse.urlencode({"query": query, "limit": min(limit, 100), "fields": fields})
+    headers = {}
+    key = os.getenv("S2_API_KEY", os.getenv("Semantic_Search_API_KEY", "")).strip()
+    if key:
+        headers["x-api-key"] = key
+    payload = fetch_json(f"https://api.semanticscholar.org/graph/v1/paper/search?{params}", headers=headers)
+    rows: list[SourceRecord] = []
+    for paper in (payload or {}).get("data", []):
+        ext = paper.get("externalIds") or {}
+        pdf = paper.get("openAccessPdf") or {}
+        tldr = paper.get("tldr") or {}
+        title = paper.get("title") or ""
+        paper_id = paper.get("paperId") or ""
+        authors = [author.get("name", "") for author in paper.get("authors", []) if author.get("name")]
+        rows.append(
+            SourceRecord(
+                source_id=stable_id("src", f"s2:{paper_id}:{ext.get('DOI', '')}:{title}"),
+                title=title,
+                provider="semantic_scholar",
+                url=paper.get("url") or "",
+                abstract=paper.get("abstract") or "",
+                snippet=(tldr.get("text") if isinstance(tldr, dict) else "") or "",
+                authors=authors,
+                year=paper.get("year"),
+                venue=paper.get("venue") or "",
+                doi=ext.get("DOI", ""),
+                arxiv_id=ext.get("ArXiv", ""),
+                pubmed_id=ext.get("PubMed", ""),
+                semantic_scholar_id=paper_id,
+                pdf_url=(pdf.get("url") if isinstance(pdf, dict) else "") or "",
+                citation_count=paper.get("citationCount"),
+                fields=list(paper.get("fieldsOfStudy") or []),
+            )
+        )
+    return rows
+
+
+def xml_text(element: ET.Element | None) -> str:
+    if element is None:
+        return ""
+    return " ".join(text.strip() for text in element.itertext() if text and text.strip())
+
+
+def parse_pubmed_articles(xml_text_value: str) -> list[dict[str, Any]]:
+    root = ET.fromstring(xml_text_value)
+    articles: list[dict[str, Any]] = []
+    for pubmed_article in root.findall("./PubmedArticle"):
+        article = pubmed_article.find(".//Article")
+        if article is None:
+            continue
+        abstract_parts = []
+        for part in article.findall(".//Abstract/AbstractText"):
+            label = part.attrib.get("Label")
+            text = xml_text(part)
+            if label and text:
+                abstract_parts.append(f"{label}: {text}")
+            elif text:
+                abstract_parts.append(text)
+        authors = []
+        for author in article.findall(".//Author"):
+            first = xml_text(author.find("./ForeName"))
+            last = xml_text(author.find("./LastName"))
+            name = " ".join(part for part in [first, last] if part)
+            if name:
+                authors.append(name)
+        doi = ""
+        for article_id in pubmed_article.findall(".//ArticleId"):
+            if article_id.attrib.get("IdType") == "doi":
+                doi = xml_text(article_id)
+                break
+        articles.append(
+            {
+                "pmid": xml_text(pubmed_article.find(".//PMID")),
+                "title": xml_text(article.find(".//ArticleTitle")),
+                "abstract": " ".join(abstract_parts),
+                "authors": authors,
+                "year": parse_year(xml_text(article.find(".//Journal/JournalIssue/PubDate/Year"))),
+                "venue": xml_text(article.find(".//Journal/Title")),
+                "doi": doi,
+            }
+        )
+    return articles
+
+
+def search_pubmed(query: str, limit: int) -> list[SourceRecord]:
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    params: dict[str, Any] = {
+        "db": "pubmed",
+        "term": query,
+        "retmax": min(limit, 100),
+        "retmode": "json",
+        "sort": "relevance",
+        "tool": "DeepWebSearchSkill",
+    }
+    email = os.getenv("NCBI_EMAIL", "").strip()
+    key = os.getenv("NCBI_API_KEY", "").strip()
+    if email:
+        params["email"] = email
+    if key:
+        params["api_key"] = key
+    search_payload = fetch_json(f"{base}/esearch.fcgi?{urllib.parse.urlencode(params)}")
+    ids = search_payload.get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    fetch_params = {
+        "db": "pubmed",
+        "id": ",".join(ids),
+        "retmode": "xml",
+        "tool": "DeepWebSearchSkill",
+    }
+    if email:
+        fetch_params["email"] = email
+    if key:
+        fetch_params["api_key"] = key
+    articles = parse_pubmed_articles(fetch_text(f"{base}/efetch.fcgi?{urllib.parse.urlencode(fetch_params)}"))
+    rows: list[SourceRecord] = []
+    for article in articles:
+        pmid = article.get("pmid", "")
+        title = article.get("title", "")
+        rows.append(
+            SourceRecord(
+                source_id=stable_id("src", f"pubmed:{pmid}:{article.get('doi', '')}:{title}"),
+                title=title,
+                provider="pubmed",
+                url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+                abstract=article.get("abstract", ""),
+                authors=list(article.get("authors") or []),
+                year=article.get("year"),
+                venue=article.get("venue", ""),
+                doi=article.get("doi", ""),
+                pubmed_id=pmid,
+                fields=["Medicine", "Biology"],
             )
         )
     return rows
 
 
 SEARCHERS = {
+    "tavily": search_tavily,
+    "semantic_scholar": search_semantic_scholar,
+    "pubmed": search_pubmed,
     "arxiv": search_arxiv,
     "openalex": search_openalex,
 }
@@ -298,7 +522,15 @@ def dedupe_sources(sources: list[SourceRecord]) -> list[SourceRecord]:
     seen: set[str] = set()
     output: list[SourceRecord] = []
     for source in sources:
-        key = source.doi.lower() or source.arxiv_id.lower() or slug(source.title)
+        key = (
+            source.doi.lower()
+            or source.arxiv_id.lower()
+            or source.pubmed_id.lower()
+            or source.semantic_scholar_id.lower()
+            or source.openalex_id.lower()
+            or source.url.lower()
+            or slug(source.title)
+        )
         if not key or key in seen:
             continue
         seen.add(key)
@@ -315,7 +547,7 @@ def search_phrases(question: str) -> list[str]:
 
 
 def source_matches(target_phrases: list[str], source: SourceRecord) -> list[str]:
-    haystack = slug(f"{source.title} {source.abstract}")
+    haystack = slug(f"{source.title} {source.abstract} {source.snippet}")
     matches = [phrase for phrase in target_phrases if phrase in haystack]
     if "domain insertion" in haystack and "domain insertion" not in matches:
         matches.append("domain insertion")
@@ -334,15 +566,22 @@ def score_sources(question: str, sources: list[SourceRecord]) -> list[SourceReco
     terms = {term for term in slug(question).split() if len(term) > 2}
     current_year = datetime.now().year
     target_phrases = search_phrases(question)
+    provider_bonus_by_name = {
+        "arxiv": 0.08,
+        "semantic_scholar": 0.07,
+        "pubmed": 0.06,
+        "openalex": 0.04,
+        "tavily": 0.03,
+    }
     for source in sources:
-        haystack = set(slug(f"{source.title} {source.abstract}").split())
+        haystack = set(slug(f"{source.title} {source.abstract} {source.snippet}").split())
         overlap = len(terms & haystack) / max(len(terms), 1)
         source.matches = source_matches(target_phrases, source)
         phrase_bonus = min(0.35, 0.07 * len(source.matches))
         recency = 0.0
         if source.year:
             recency = max(0.0, min(1.0, 1.0 - ((current_year - source.year) / 15.0)))
-        provider_bonus = 0.08 if source.provider == "arxiv" else 0.04
+        provider_bonus = provider_bonus_by_name.get(source.provider, 0.03)
         source.score = round(min(1.0, 0.55 * overlap + 0.24 * phrase_bonus + 0.14 * recency + provider_bonus), 3)
     return sorted(sources, key=lambda item: item.score, reverse=True)
 
@@ -359,7 +598,7 @@ def focus_ranked_sources(question: str, sources: list[SourceRecord], max_results
 def evidence_rows(sources: list[SourceRecord], max_items: int) -> list[dict[str, Any]]:
     rows = []
     for source in sources[:max_items]:
-        text = source.abstract or source.title
+        text = source.abstract or source.snippet or source.title
         rows.append(
             {
                 "evidence_id": stable_id("ev", f"{source.source_id}:{text[:120]}"),
@@ -492,10 +731,24 @@ def parse_providers(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def wait_for_provider_rate_limit(provider: str) -> None:
+    interval = PROVIDER_RATE_LIMIT_SECONDS.get(provider, 0.0)
+    if interval <= 0:
+        return
+    with PROVIDER_RATE_LOCK:
+        now = time.monotonic()
+        wait_seconds = PROVIDER_NEXT_ALLOWED_AT.get(provider, now) - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+        PROVIDER_NEXT_ALLOWED_AT[provider] = now + interval
+
+
 def provider_search(provider: str, query: QueryRecord, limit: int) -> tuple[list[SourceRecord], dict[str, Any]]:
     started = time.time()
     if provider not in SEARCHERS:
         raise ValueError(f"unsupported provider: {provider}")
+    wait_for_provider_rate_limit(provider)
     rows = SEARCHERS[provider](query.query, limit)
     return rows, {
         "timestamp": now_iso(),
@@ -517,17 +770,38 @@ def provider_error(provider: str, query: QueryRecord, exc: Exception) -> dict[st
     }
 
 
-def run_provider_queries(queries: list[QueryRecord], providers: list[str], limit: int) -> tuple[list[SourceRecord], list[dict[str, Any]]]:
-    sources: list[SourceRecord] = []
-    provenance: list[dict[str, Any]] = []
+PROVIDER_EXCEPTIONS = (urllib.error.URLError, TimeoutError, socket.timeout, RuntimeError, ValueError, json.JSONDecodeError, ET.ParseError)
+
+
+def provider_task(index: int, provider: str, query: QueryRecord, limit: int) -> tuple[int, list[SourceRecord], dict[str, Any]]:
+    try:
+        rows, event = provider_search(provider, query, limit)
+        return index, rows, event
+    except PROVIDER_EXCEPTIONS as exc:
+        return index, [], provider_error(provider, query, exc)
+
+
+def run_provider_queries(queries: list[QueryRecord], providers: list[str], limit: int, workers: int = DEFAULT_WORKERS) -> tuple[list[SourceRecord], list[dict[str, Any]]]:
+    tasks: list[tuple[int, str, QueryRecord]] = []
     for query in queries:
         for provider in providers:
-            try:
-                rows, event = provider_search(provider, query, limit)
-                sources.extend(rows)
-                provenance.append(event)
-            except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError, json.JSONDecodeError, ET.ParseError) as exc:
-                provenance.append(provider_error(provider, query, exc))
+            tasks.append((len(tasks), provider, query))
+    if not tasks:
+        return [], []
+
+    worker_count = max(1, min(workers, len(tasks)))
+    if worker_count == 1:
+        results = [provider_task(index, provider, query, limit) for index, provider, query in tasks]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(provider_task, index, provider, query, limit) for index, provider, query in tasks]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+
+    sources: list[SourceRecord] = []
+    provenance: list[dict[str, Any]] = []
+    for _, rows, event in sorted(results, key=lambda item: item[0]):
+        sources.extend(rows)
+        provenance.append(event)
     return sources, provenance
 
 
@@ -567,6 +841,7 @@ def write_bundle_outputs(
 def run_search(args: argparse.Namespace) -> int:
     providers = parse_providers(args.providers)
     queries = make_queries(args.question, args.profile, providers)
+    workers = max(1, args.workers)
     out = Path(args.out).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
 
@@ -575,6 +850,7 @@ def run_search(args: argparse.Namespace) -> int:
         "profile": args.profile,
         "providers": providers,
         "max_results": args.max_results,
+        "workers": workers,
         "created_at": now_iso(),
     }
     write_json(out / BUNDLE_FILES["request"], request)
@@ -589,7 +865,7 @@ def run_search(args: argparse.Namespace) -> int:
         return 0
 
     per_query_limit = max(1, min(args.max_results, 10))
-    sources, provenance = run_provider_queries(queries, providers, per_query_limit)
+    sources, provenance = run_provider_queries(queries, providers, per_query_limit, workers=workers)
     ranked = focus_ranked_sources(args.question, score_sources(args.question, dedupe_sources(sources)), args.max_results)
     write_bundle_outputs(out, args.question, args.profile, providers, request["created_at"], queries, ranked, provenance, args.max_evidence)
     print(f"Wrote deep web search bundle: {out}")
@@ -604,9 +880,14 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("question")
     search.add_argument("--out", default="./deep-web-search-bundle")
     search.add_argument("--profile", choices=sorted(PROFILE_EXPANSIONS), default="general")
-    search.add_argument("--providers", default=",".join(DEFAULT_PROVIDERS), help="Comma-separated providers: arxiv,openalex")
+    search.add_argument(
+        "--providers",
+        default=",".join(DEFAULT_PROVIDERS),
+        help="Comma-separated providers: tavily,semantic_scholar,pubmed,openalex,arxiv",
+    )
     search.add_argument("--max-results", type=int, default=20)
     search.add_argument("--max-evidence", type=int, default=8)
+    search.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel provider request workers; use 1 for serial execution")
     search.add_argument("--plan-only", action="store_true")
     search.set_defaults(func=run_search)
 

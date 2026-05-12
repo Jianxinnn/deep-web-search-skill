@@ -2,6 +2,7 @@ import unittest
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "skills" / "deep-web-search" / "scripts" / "deep_web_search.py"
@@ -86,6 +87,119 @@ class DeepWebSearchTests(unittest.TestCase):
 
     def test_parse_providers_discards_empty_parts(self):
         self.assertEqual(deep_web_search.parse_providers("arxiv, openalex,, "), ["arxiv", "openalex"])
+
+    def test_run_provider_queries_parallel_preserves_task_order(self):
+        def fake_a(query, limit):
+            return [deep_web_search.SourceRecord(source_id=f"a-{query}", title=query, provider="fake_a")]
+
+        def fake_b(query, limit):
+            return [deep_web_search.SourceRecord(source_id=f"b-{query}", title=query, provider="fake_b")]
+
+        queries = [
+            deep_web_search.QueryRecord("q1", "primary", ["fake_a", "fake_b"]),
+            deep_web_search.QueryRecord("q2", "primary", ["fake_a", "fake_b"]),
+        ]
+        with patch.dict(deep_web_search.SEARCHERS, {"fake_a": fake_a, "fake_b": fake_b}, clear=True):
+            sources, provenance = deep_web_search.run_provider_queries(queries, ["fake_a", "fake_b"], 1, workers=2)
+
+        self.assertEqual([source.source_id for source in sources], ["a-q1", "b-q1", "a-q2", "b-q2"])
+        self.assertEqual(
+            [(event["provider"], event["query"], event["status"]) for event in provenance],
+            [("fake_a", "q1", "ok"), ("fake_b", "q1", "ok"), ("fake_a", "q2", "ok"), ("fake_b", "q2", "ok")],
+        )
+
+    def test_semantic_scholar_rate_limit_waits_between_requests(self):
+        now = {"value": 10.0}
+        sleeps = []
+
+        def fake_monotonic():
+            return now["value"]
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            now["value"] += seconds
+
+        deep_web_search.PROVIDER_NEXT_ALLOWED_AT.clear()
+        with patch.object(deep_web_search.time, "monotonic", fake_monotonic):
+            with patch.object(deep_web_search.time, "sleep", fake_sleep):
+                deep_web_search.wait_for_provider_rate_limit("semantic_scholar")
+                deep_web_search.wait_for_provider_rate_limit("semantic_scholar")
+
+        self.assertEqual(sleeps, [1.0])
+        self.assertEqual(deep_web_search.PROVIDER_NEXT_ALLOWED_AT["semantic_scholar"], 12.0)
+        deep_web_search.PROVIDER_NEXT_ALLOWED_AT.clear()
+
+    def test_default_providers_include_key_backed_sources(self):
+        self.assertEqual(
+            deep_web_search.DEFAULT_PROVIDERS,
+            ["tavily", "semantic_scholar", "pubmed", "openalex", "arxiv"],
+        )
+
+    def test_tavily_requires_api_key(self):
+        with patch.dict(deep_web_search.os.environ, {"TAVILY_API_KEY": ""}, clear=True):
+            with self.assertRaises(RuntimeError):
+                deep_web_search.search_tavily("protein design", 1)
+
+    def test_tavily_normalizes_web_results(self):
+        payload = {"results": [{"url": "https://example.com/a", "title": "Example A", "content": "Useful web evidence."}]}
+        with patch.dict(deep_web_search.os.environ, {"TAVILY_API_KEY": "test"}, clear=True):
+            with patch.object(deep_web_search, "post_json", return_value=payload):
+                rows = deep_web_search.search_tavily("protein design", 1)
+
+        self.assertEqual(rows[0].provider, "tavily")
+        self.assertEqual(rows[0].source_type, "web")
+        self.assertEqual(rows[0].snippet, "Useful web evidence.")
+
+    def test_semantic_scholar_normalizes_papers(self):
+        payload = {
+            "data": [
+                {
+                    "paperId": "abc",
+                    "url": "https://www.semanticscholar.org/paper/abc",
+                    "title": "Semantic Scholar Paper",
+                    "abstract": "Paper abstract.",
+                    "authors": [{"name": "Ada Lovelace"}],
+                    "year": 2025,
+                    "venue": "Example Venue",
+                    "citationCount": 12,
+                    "openAccessPdf": {"url": "https://example.com/paper.pdf"},
+                    "externalIds": {"DOI": "10.example/s2", "PubMed": "123", "ArXiv": "2501.00001"},
+                    "fieldsOfStudy": ["Computer Science"],
+                    "tldr": {"text": "Short summary."},
+                }
+            ]
+        }
+        with patch.object(deep_web_search, "fetch_json", return_value=payload):
+            rows = deep_web_search.search_semantic_scholar("agent skills", 1)
+
+        self.assertEqual(rows[0].provider, "semantic_scholar")
+        self.assertEqual(rows[0].semantic_scholar_id, "abc")
+        self.assertEqual(rows[0].doi, "10.example/s2")
+        self.assertEqual(rows[0].snippet, "Short summary.")
+
+    def test_pubmed_parser_normalizes_articles(self):
+        xml = """<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>123</PMID>
+      <Article>
+        <ArticleTitle>PubMed Paper</ArticleTitle>
+        <Abstract><AbstractText Label="Background">Useful biomedical evidence.</AbstractText></Abstract>
+        <Journal><Title>Example Journal</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+        <AuthorList><Author><ForeName>Ada</ForeName><LastName>Lovelace</LastName></Author></AuthorList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData><ArticleIdList><ArticleId IdType="doi">10.example/pubmed</ArticleId></ArticleIdList></PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>
+"""
+        rows = deep_web_search.parse_pubmed_articles(xml)
+
+        self.assertEqual(rows[0]["pmid"], "123")
+        self.assertEqual(rows[0]["title"], "PubMed Paper")
+        self.assertEqual(rows[0]["year"], 2024)
+        self.assertEqual(rows[0]["doi"], "10.example/pubmed")
 
     def test_bundle_manifest_uses_canonical_file_map(self):
         manifest = deep_web_search.bundle_manifest("question", "general", "2026-01-01T00:00:00+00:00", {"queries": 1})
